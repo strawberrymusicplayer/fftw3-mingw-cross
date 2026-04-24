@@ -1,0 +1,172 @@
+name: Build
+on: [push, pull_request]
+
+env:
+  max_releases: '6'
+  curl_options: '-f -O -L --connect-timeout 60 -m 900 --retry 15 --retry-delay 10 --retry-max-time 300 --retry-all-errors'
+
+  fftw_version: '3.3.11'
+  mingw_w64_version: '14.0.0'
+
+
+jobs:
+
+  setup:
+    name: Setup
+    if: (!contains(github.event.head_commit.message, 'skip ci'))
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{steps.set_release_tag.outputs.release_tag}}
+    steps:
+      - name: Set release tag
+        id: set_release_tag
+        shell: bash
+        run: echo "release_tag=${{env.fftw_version}}.${{github.run_number}}" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build FFTW3 MinGW-W64
+    needs:
+      - setup
+
+    strategy:
+      fail-fast: false
+      matrix:
+        buildtype: [ 'debug', 'release' ]
+
+    runs-on: ubuntu-latest
+    container: opensuse/tumbleweed
+
+    steps:
+      - name: Add repo
+        run: zypper ar -f https://download.opensuse.org/repositories/windows:/mingw:/win64/openSUSE_Tumbleweed/ repo-mingw-win64
+
+      - name: Update packages
+        run: zypper -n --gpg-auto-import-keys ref
+
+      - name: Upgrade packages
+        run: zypper -n --gpg-auto-import-keys dup -l -y
+
+      - name: Install dependencies
+        run: zypper -n --gpg-auto-import-keys in sed gawk git gh make bzip2 gcc gcc-c++ mingw64-cross-gcc mingw64-cross-binutils mingw64-headers
+
+      - name: Set buildtype
+        run: echo "buildtype=$(echo ${{matrix.buildtype}} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Set release name
+        run: echo "release_name=fftw-x86_64-w64-mingw32-${{env.buildtype}}-${{needs.setup.outputs.release_tag}}" >> $GITHUB_ENV
+
+      - name: Set prefix path
+        run: echo "prefix_path=/usr/local/${{env.release_name}}" >> $GITHUB_ENV
+
+      - name: Create directories
+        run: mkdir -p ${{env.prefix_path}}/{lib,bin,include}
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Add safe git directory
+        run: git config --global --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Create directories
+        run: mkdir downloads build
+
+      - name: Download mingw-w64
+        working-directory: downloads
+        run: curl ${{env.curl_options}} https://downloads.sourceforge.net/project/mingw-w64/mingw-w64/mingw-w64-release/mingw-w64-v${{env.mingw_w64_version}}.tar.bz2
+
+      - name: Build and install gendef
+        run: |
+          mkdir -p build/mingw-w64-src build/gendef
+          tar -xf downloads/mingw-w64-v${{env.mingw_w64_version}}.tar.bz2 -C build/mingw-w64-src --strip-components=1
+          cd build/gendef
+          ../mingw-w64-src/mingw-w64-tools/gendef/configure --prefix=/usr/local
+          make -j ${{env.make_jobs}}
+          make install
+
+      - name: Download fftw
+        working-directory: downloads
+        run: |
+          curl ${{env.curl_options}} https://www.fftw.org/fftw-${{env.fftw_version}}.tar.gz || \
+          curl ${{env.curl_options}} https://downloads.sourceforge.net/project/fftw/fftw/${{env.fftw_version}}/fftw-${{env.fftw_version}}.tar.gz || \
+          curl ${{env.curl_options}} https://netix.dl.sourceforge.net/project/fftw/fftw/${{env.fftw_version}}/fftw-${{env.fftw_version}}.tar.gz || \
+          curl ${{env.curl_options}} https://packages.strawberrymusicplayer.org/fftw-${{env.fftw_version}}.tar.gz
+
+      - name: Extract fftw
+        working-directory: build
+        run: tar -xf ../downloads/fftw-${{env.fftw_version}}.tar.gz
+
+      - name: Configure fftw
+        working-directory: build/fftw-${{env.fftw_version}}
+        run: ./configure --build="x86_64-linux-gnu" --host="x86_64-w64-mingw32" --prefix="${{env.prefix_path}}" --disable-static --enable-shared --enable-threads --with-combined-threads --disable-doc --with-our-malloc --enable-sse2 --enable-avx --enable-avx2 --enable-avx512 --enable-avx-128-fma --enable-generic-simd128 --enable-generic-simd256
+
+      - name: Build fftw
+        working-directory: build/fftw-${{env.fftw_version}}
+        run: make -j ${{env.make_jobs}}
+
+      - name: Generate .def file with gendef
+        working-directory: build/fftw-${{env.fftw_version}}
+        run: |
+          gendef .libs/libfftw3-3.dll
+          cat libfftw3-3.def
+
+      - name: Install fftw
+        working-directory: build/fftw-${{env.fftw_version}}
+        run: |
+          make install
+          cp -v libfftw3-3.def ${{env.prefix_path}}/lib/
+
+      - name: Create archive
+        run: tar -cJf ${{env.release_name}}.tar.xz --transform "s,^{{env.prefix_path}},${{env.release_name}}," ${{env.prefix_path}}
+
+      - name: Set have release
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: echo "have_release=$(gh release view "${{needs.setup.outputs.release_tag}}" | grep "${{needs.setup.outputs.release_tag}}" >/dev/null 2>&1 && echo 1 || echo 0)" >> $GITHUB_ENV
+
+      - name: Set release notes file
+        run: echo "release_notes_file=release_notes.txt" >> $GITHUB_ENV
+
+      - name: Create release notes
+        run: echo "FFTW ${{env.fftw_version}}" > "${{env.release_notes_file}}"
+
+      - name: Create new release
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/release') && env.have_release != '1'
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: gh release create -d -F "${{env.release_notes_file}}" -t "FFTW ${{env.fftw_version}} MinGW Release" "${{needs.setup.outputs.release_tag}}" "${{env.release_name}}.tar.xz"
+
+      - name: Update existing release
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/release') && env.have_release == '1'
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: gh release upload "${{needs.setup.outputs.release_tag}}" "${{env.release_name}}.tar.xz"
+
+
+  publish-release:
+    name: Publish Release
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/release'
+    runs-on: ubuntu-latest
+    needs:
+      - setup
+      - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Publish Release
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: gh release edit --draft=false --latest "${{needs.setup.outputs.release_tag}}"
+
+      - name: Delete old releases
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: |
+          while [ "$(git tag | wc -l)" -ge "${{env.max_releases}}" ]; do
+            oldest_tag=$(git tag | sort -V | head -1)
+            gh release delete "${oldest_tag}"
+            git tag -d "${oldest_tag}"
+            git push --delete origin "${oldest_tag}"
+          done
