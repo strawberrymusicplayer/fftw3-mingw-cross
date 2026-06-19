@@ -62,7 +62,7 @@ jobs:
         run: mkdir -p ${{env.prefix_path}}/{lib,bin,include}
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Add safe git directory
         run: git config --global --add safe.directory ${GITHUB_WORKSPACE}
@@ -154,7 +154,7 @@ jobs:
       - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
